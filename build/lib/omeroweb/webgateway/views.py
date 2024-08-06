@@ -128,14 +128,6 @@ def _safestr(s):
     return unicode(s).encode("utf-8")
 
 
-# Regular expression that represents the characters in ASCII that are
-# allowed in a valid JavaScript variable name.  Function names adhere to
-# the same rules.
-# See:
-#   https://stackoverflow.com/questions/1661197/what-characters-are-valid-for-javascript-variable-names
-VALID_JS_VARIABLE = re.compile(r"^[a-zA-Z_$][0-9a-zA-Z_$]*$")
-
-
 class UserProxy(object):
     """
     Represents the current user of the connection, with methods delegating to
@@ -1443,8 +1435,6 @@ def jsonp(f):
                 return rv
             c = request.GET.get("callback", None)
             if c is not None and not kwargs.get("_internal", False):
-                if not VALID_JS_VARIABLE.match(c):
-                    return HttpResponseBadRequest("Invalid callback")
                 rv = json.dumps(rv)
                 rv = "%s(%s)" % (c, rv)
                 # mimetype for JSONP is application/javascript
@@ -1605,7 +1595,13 @@ def wellData_json(request, conn=None, _internal=False, **kwargs):
 @login_required()
 @jsonp
 def plateGrid_json(request, pid, field=0, conn=None, **kwargs):
-    """ """
+    """
+    Layout depends on settings 'omero.web.plate_layout' which
+    can be overridden with request param e.g. ?layout=shrink.
+    Use "expand" to expand to multiple of 8 x 12 grid
+    Or "shrink" to remove rows/cols before first Well
+    Or "trim" to neither expand nor shrink
+    """
     try:
         field = long(field or 0)
     except ValueError:
@@ -1620,7 +1616,17 @@ def plateGrid_json(request, pid, field=0, conn=None, **kwargs):
             return reverse(prefix, args=(iid, thumbsize))
         return reverse(prefix, args=(iid,))
 
-    plateGrid = PlateGrid(conn, pid, field, kwargs.get("urlprefix", get_thumb_url))
+    layout = request.GET.get("layout")
+    if layout not in ("shrink", "trim", "expand"):
+        layout = settings.PLATE_LAYOUT
+
+    plateGrid = PlateGrid(
+        conn,
+        pid,
+        field,
+        kwargs.get("urlprefix", get_thumb_url),
+        plate_layout=layout,
+    )
 
     plate = plateGrid.plate
     if plate is None:
@@ -2944,7 +2950,6 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
 
     try:
         cols = t.getHeaders()
-        column_names = [col.name for col in cols]
         col_indices = range(len(cols))
         if col_names:
             enumerated_columns = (
@@ -2961,6 +2966,7 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
                         cols.append(j)
                         break
 
+        column_names = [col.name for col in cols]
         rows = t.getNumberOfRows()
 
         offset = kwargs.get("offset", 0)
@@ -2973,6 +2979,7 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
                 if request.GET.get("limit") is not None
                 else rows
             )
+
         range_start = offset
         range_size = limit
         range_end = min(rows, range_start + range_size)
@@ -2997,6 +3004,13 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
                 hits = hits[range_start:range_end]
             except Exception:
                 return dict(error="Error executing query: %s" % query)
+
+        if len(hits) > settings.MAX_TABLE_DOWNLOAD_ROWS:
+            error = (
+                "Trying to download %s rows exceeds configured"
+                " omero.web.max_table_download_rows of %s"
+            ) % (len(hits), settings.MAX_TABLE_DOWNLOAD_ROWS)
+            return {"error": error, "status": 404}
 
         def row_generator(table, h):
             # hits are all consecutive rows - can load them in batches
