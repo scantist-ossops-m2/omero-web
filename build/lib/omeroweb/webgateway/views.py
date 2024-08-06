@@ -40,7 +40,7 @@ from django.http import (
 from django.views.decorators.http import require_POST
 from django.views.decorators.debug import sensitive_post_parameters
 from django.utils.decorators import method_decorator
-from django.urls import reverse, NoReverseMatch
+from django.core.urlresolvers import reverse, NoReverseMatch
 from django.conf import settings
 from wsgiref.util import FileWrapper
 from omero.rtypes import rlong, unwrap
@@ -49,7 +49,7 @@ from .util import points_string_to_XY_list, xy_list_to_bbox
 from .plategrid import PlateGrid
 from omeroweb.version import omeroweb_buildyear as build_year
 from .marshal import imageMarshal, shapeMarshal, rgb_int2rgba
-from django.templatetags.static import static
+from django.contrib.staticfiles.templatetags.staticfiles import static
 from django.views.generic import View
 from django.shortcuts import render
 from omeroweb.webadmin.forms import LoginForm
@@ -72,7 +72,7 @@ import tempfile
 from omero import ApiUsageException
 from omero.util.decorators import timeit, TimeIt
 from omeroweb.httprsp import HttpJavascriptResponse, HttpJavascriptResponseServerError
-from omeroweb.connector import Connector, Server
+from omeroweb.connector import Server
 
 import glob
 
@@ -93,6 +93,7 @@ import zipfile
 import shutil
 
 from omeroweb.decorators import login_required, ConnCleaningHttpResponse
+from omeroweb.connector import Connector
 from omeroweb.webgateway.util import zip_archived_files, LUTS_IN_PNG
 from omeroweb.webgateway.util import get_longs, getIntOrDefault
 
@@ -125,14 +126,6 @@ def index(request):
 
 def _safestr(s):
     return unicode(s).encode("utf-8")
-
-
-# Regular expression that represents the characters in ASCII that are
-# allowed in a valid JavaScript variable name.  Function names adhere to
-# the same rules.
-# See:
-#   https://stackoverflow.com/questions/1661197/what-characters-are-valid-for-javascript-variable-names
-VALID_JS_VARIABLE = re.compile(r"^[a-zA-Z_$][0-9a-zA-Z_$]*$")
 
 
 class UserProxy(object):
@@ -229,53 +222,6 @@ class UserProxy(object):
 #    def close (self, c):
 #        self._log('close',c)
 # _session_cb = SessionCB()
-
-
-def validate_rdef_query(func):
-    @wraps(func)
-    def wrapper_validate(request, *args, **kwargs):
-        r = None
-        try:
-            r = request.GET
-        except Exception:
-            return HttpResponseServerError("Endpoint improperly configured")
-
-        if "c" not in r:
-            return HttpResponseBadRequest(
-                "Rendering settings must specify channels as c"
-            )
-        channels, windows, colors = _split_channel_info(r["c"])
-        # Need the same number of channels, windows, and colors
-        for i in range(0, len(channels)):
-            window = windows[i]
-            # Unspecified windows and colors are returned as None
-            # Validation requires windows to be specified
-            if window[0] is None or window[1] is None:
-                return HttpResponseBadRequest("Must specify window for each channel")
-            if colors[i] is None:
-                return HttpResponseBadRequest("Must specify color for each channel")
-        if "m" not in r or r["m"] not in ["g", "c"]:
-            return HttpResponseBadRequest(
-                'Query parameter "m" must be present with value either "g" or "c"'
-            )
-        # TODO: What to do about z, t, and p?
-        if "maps" in r:
-            map_json = r["maps"]
-            try:
-                # If coming from request string, need to load -> json
-                if isinstance(map_json, str):
-                    map_json = json.loads(map_json)
-            except Exception:
-                logger.warn("Failed to parse maps JSON")
-                return HttpResponseBadRequest("Failed to parse maps JSON")
-            rchannels = r["c"].split(",")
-            if len(map_json) != len(rchannels):
-                return HttpResponseBadRequest(
-                    'Number of "maps" must match number of channels'
-                )
-        return func(request, *args, **kwargs)
-
-    return wrapper_validate
 
 
 def _split_channel_info(rchannels):
@@ -404,7 +350,7 @@ def _render_thumbnail(request, iid, w=None, h=None, conn=None, _defcb=None, **kw
     @param h:           Thumbnail max height
     @return:            http response containing jpeg
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
 
     server_settings = request.session.get("server_settings", {}).get("browser", {})
     defaultSize = server_settings.get("thumb_default_size", 96)
@@ -481,7 +427,7 @@ def render_roi_thumbnail(request, roiId, w=None, h=None, conn=None, **kwargs):
     z-section) then render a region around that shape, scale to width and
     height (or default size) and draw the shape on to the region
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
 
     # need to find the z indices of the first shape in T
     result = conn.getRoiService().findByRoi(long(roiId), None, conn.SERVICE_OPTS)
@@ -537,7 +483,7 @@ def render_shape_thumbnail(request, shapeId, w=None, h=None, conn=None, **kwargs
     For the given Shape, redner a region around that shape, scale to width and
     height (or default size) and draw the shape on to the region.
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
 
     # need to find the z indices of the first shape in T
     params = omero.sys.Parameters()
@@ -882,40 +828,31 @@ def _get_signature_from_request(request):
     return rv
 
 
-def _get_inverted_enabled(request, sizeC):
+def _get_maps_enabled(request, name, sizeC=0):
     """
-    Parses 'maps' query string from request for 'inverted' and 'reverse'
-
-    @param request: http request
-    @return:        List of boolean representing whether the
-                    corresponding channel is inverted
+    Parses 'maps' query string from request
     """
-
-    inversions = None
+    codomains = None
     if "maps" in request:
         map_json = request["maps"]
-        inversions = []
+        codomains = []
         try:
             # If coming from request string, need to load -> json
-            if isinstance(map_json, str):
+            if isinstance(map_json, (unicode, str)):
                 map_json = json.loads(map_json)
-            for codomain_map in map_json:
-                enabled = False
-                # 'reverse' is now deprecated (5.4.0). Check for 'inverted'
-                #  first. inverted is True if 'inverted' OR 'reverse' is enabled
-                m = codomain_map.get("inverted")
-                if m is None:
-                    m = codomain_map.get("reverse")
-                # If None, no change to saved status
-                if m is not None:
-                    enabled = m.get("enabled") in (True, "true")
-                inversions.append(enabled)
-            while len(inversions) < sizeC:
-                inversions.append(None)
+            sizeC = max(len(map_json), sizeC)
+            for c in range(sizeC):
+                enabled = None
+                if len(map_json) > c:
+                    m = map_json[c].get(name)
+                    # If None, no change to saved status
+                    if m is not None:
+                        enabled = m.get("enabled") in (True, "true")
+                codomains.append(enabled)
         except Exception:
             logger.debug("Invalid json for query ?maps=%s" % map_json)
-            inversions = None
-    return inversions
+            codomains = None
+    return codomains
 
 
 def _get_prepared_image(
@@ -942,34 +879,34 @@ def _get_prepared_image(
     img = conn.getObject("Image", iid)
     if img is None:
         return
+    invert_flags = None
+    if "maps" in r:
+        reverses = _get_maps_enabled(r, "reverse", img.getSizeC())
+        # 'reverse' is now deprecated (5.4.0). Also check for 'invert'
+        invert_flags = _get_maps_enabled(r, "inverted", img.getSizeC())
+        # invert is True if 'invert' OR 'reverse' is enabled
+        if reverses is not None and invert_flags is not None:
+            invert_flags = [
+                z[0] if z[0] is not None else z[1] for z in zip(invert_flags, reverses)
+            ]
+        try:
+            # quantization maps (just applied, not saved at the moment)
+            qm = [m.get("quantization") for m in json.loads(r["maps"])]
+            img.setQuantizationMaps(qm)
+        except Exception:
+            logger.debug("Failed to set quantization maps")
 
     if "c" in r:
         logger.debug("c=" + r["c"])
-        requestedChannels, windows, colors = _split_channel_info(r["c"])
-        invert_flags = None
-        if "maps" in r:
-            invert_flags = _get_inverted_enabled(r, img.getSizeC())
-            try:
-                # quantization maps (just applied, not saved at the moment)
-                # Need to pad the list of quant maps to have one entry per channel
-                totalChannels = img.getSizeC()
-                channelIndices = [abs(int(ch)) - 1 for ch in requestedChannels]
-                qm = [m.get("quantization") for m in json.loads(r["maps"])]
-                allMaps = [None] * totalChannels
-                for i in range(0, len(channelIndices)):
-                    if i < len(qm):
-                        allMaps[channelIndices[i]] = qm[i]
-                img.setQuantizationMaps(allMaps)
-            except Exception:
-                logger.info("Failed to set quantization maps")
-        allChannels = range(1, img.getSizeC() + 1)
+        activechannels, windows, colors = _split_channel_info(r["c"])
+        allchannels = range(1, img.getSizeC() + 1)
         # If saving, apply to all channels
         if saveDefs and not img.setActiveChannels(
-            allChannels, windows, colors, invert_flags
+            allchannels, windows, colors, invert_flags
         ):
             logger.debug("Something bad happened while setting the active channels...")
         # Save the active/inactive state of the channels
-        if not img.setActiveChannels(requestedChannels, windows, colors, invert_flags):
+        if not img.setActiveChannels(activechannels, windows, colors, invert_flags):
             logger.debug("Something bad happened while setting the active channels...")
 
     if r.get("m", None) == "g":
@@ -1010,8 +947,7 @@ def render_image_region(request, iid, z, t, conn=None, **kwargs):
     @param conn:        L{omero.gateway.BlitzGateway} connection
     @return:            http response wrapping jpeg
     """
-    server_id = request.session["connector"]["server_id"]
-
+    server_id = request.session["connector"].server_id
     # if the region=x,y,w,h is not parsed correctly to give 4 ints then we
     # simply provide whole image plane.
     # alternatively, could return a 404?
@@ -1130,8 +1066,7 @@ def render_image(request, iid, z=None, t=None, conn=None, **kwargs):
     @param conn:        L{omero.gateway.BlitzGateway} connection
     @return:            http response wrapping jpeg
     """
-    server_id = request.session["connector"]["server_id"]
-
+    server_id = request.session["connector"].server_id
     pi = _get_prepared_image(request, iid, server_id=server_id, conn=conn)
     if pi is None:
         raise Http404
@@ -1175,18 +1110,6 @@ def render_image(request, iid, z=None, t=None, conn=None, **kwargs):
 
 
 @login_required()
-@validate_rdef_query
-def render_image_rdef(request, iid, z=None, t=None, conn=None, **kwargs):
-    return render_image(request, iid, z=z, t=t, conn=conn, **kwargs)
-
-
-@login_required()
-@validate_rdef_query
-def render_image_region_rdef(request, iid, z=None, t=None, conn=None, **kwargs):
-    return render_image_region(request, iid, z, t, conn=conn, **kwargs)
-
-
-@login_required()
 def render_ome_tiff(request, ctx, cid, conn=None, **kwargs):
     """
     Renders the OME-TIFF representation of the image(s) with id cid in ctx
@@ -1207,7 +1130,7 @@ def render_ome_tiff(request, ctx, cid, conn=None, **kwargs):
                         if dryrun is True, returns count of images that would
                         be exported
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
     imgs = []
     if ctx == "p":
         obj = conn.getObject("Project", cid)
@@ -1358,7 +1281,7 @@ def render_movie(request, iid, axis, pos, conn=None, **kwargs):
     @return:            http response wrapping the file, or redirect to temp
                         file
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
     try:
         # Prepare a filename we'll use for temp cache, and check if file is
         # already there
@@ -1450,7 +1373,7 @@ def render_split_channel(request, iid, z, t, conn=None, **kwargs):
     @param conn:        L{omero.gateway.BlitzGateway} connection
     @return:            http response wrapping a jpeg
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
     pi = _get_prepared_image(request, iid, server_id=server_id, conn=conn)
     if pi is None:
         raise Http404
@@ -1503,7 +1426,7 @@ def jsonp(f):
         try:
             server_id = kwargs.get("server_id", None)
             if server_id is None and request.session.get("connector"):
-                server_id = request.session["connector"]["server_id"]
+                server_id = request.session["connector"].server_id
             kwargs["server_id"] = server_id
             rv = f(request, *args, **kwargs)
             if kwargs.get("_raw", False):
@@ -1512,8 +1435,6 @@ def jsonp(f):
                 return rv
             c = request.GET.get("callback", None)
             if c is not None and not kwargs.get("_internal", False):
-                if not VALID_JS_VARIABLE.match(c):
-                    return HttpResponseBadRequest("Invalid callback")
                 rv = json.dumps(rv)
                 rv = "%s(%s)" % (c, rv)
                 # mimetype for JSONP is application/javascript
@@ -1674,13 +1595,7 @@ def wellData_json(request, conn=None, _internal=False, **kwargs):
 @login_required()
 @jsonp
 def plateGrid_json(request, pid, field=0, conn=None, **kwargs):
-    """
-    Layout depends on settings 'omero.web.plate_layout' which
-    can be overridden with request param e.g. ?layout=shrink.
-    Use "expand" to expand to multiple of 8 x 12 grid
-    Or "shrink" to remove rows/cols before first Well
-    Or "trim" to neither expand nor shrink
-    """
+    """ """
     try:
         field = long(field or 0)
     except ValueError:
@@ -1695,17 +1610,7 @@ def plateGrid_json(request, pid, field=0, conn=None, **kwargs):
             return reverse(prefix, args=(iid, thumbsize))
         return reverse(prefix, args=(iid,))
 
-    layout = request.GET.get("layout")
-    if layout not in ("shrink", "trim", "expand"):
-        layout = settings.PLATE_LAYOUT
-
-    plateGrid = PlateGrid(
-        conn,
-        pid,
-        field,
-        kwargs.get("urlprefix", get_thumb_url),
-        plate_layout=layout,
-    )
+    plateGrid = PlateGrid(conn, pid, field, kwargs.get("urlprefix", get_thumb_url))
 
     plate = plateGrid.plate
     if plate is None:
@@ -2036,7 +1941,7 @@ def search_json(request, conn=None, **kwargs):
     @return:            json search results
     TODO: cache
     """
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
     opts = searchOptFromRequest(request)
     rv = []
     logger.debug("searchObjects(%s)" % (opts["search"]))
@@ -2095,7 +2000,6 @@ def search_json(request, conn=None, **kwargs):
 
 @require_POST
 @login_required()
-@validate_rdef_query
 def save_image_rdef_json(request, iid, conn=None, **kwargs):
     """
     Requests that the rendering defs passed in the request be set as the
@@ -2108,8 +2012,7 @@ def save_image_rdef_json(request, iid, conn=None, **kwargs):
     @param conn:        L{omero.gateway.BlitzGateway}
     @return:            http response 'true' or 'false'
     """
-    server_id = request.session["connector"]["server_id"]
-
+    server_id = request.session["connector"].server_id
     pi = _get_prepared_image(
         request, iid, server_id=server_id, conn=conn, saveDefs=True
     )
@@ -2255,54 +2158,6 @@ def reset_rdef_json(request, toOwners=False, conn=None, **kwargs):
     return rv
 
 
-# maybe these pair of methods should be on ImageWrapper??
-def getRenderingSettings(image):
-    rv = {}
-    chs = []
-    maps = []
-    for i, ch in enumerate(image.getChannels()):
-        act = "" if ch.isActive() else "-"
-        start = ch.getWindowStart()
-        end = ch.getWindowEnd()
-        color = ch.getLut()
-        maps.append(
-            {
-                "inverted": {"enabled": ch.isInverted()},
-                "quantization": {
-                    "coefficient": unwrap(ch.getCoefficient()),
-                    "family": unwrap(ch.getFamily()),
-                },
-            }
-        )
-        if not color or len(color) == 0:
-            color = ch.getColor().getHtml()
-        chs.append("%s%s|%s:%s$%s" % (act, i + 1, start, end, color))
-    rv["c"] = ",".join(chs)
-    rv["maps"] = maps
-    logger.info(maps)
-    rv["m"] = "g" if image.isGreyscaleRenderingModel() else "c"
-    rv["z"] = image.getDefaultZ() + 1
-    rv["t"] = image.getDefaultT() + 1
-    rv["p"] = image.getProjection()
-    return rv
-
-
-def applyRenderingSettings(image, rdef):
-    invert_flags = _get_inverted_enabled(rdef, image.getSizeC())
-    channels, windows, colors = _split_channel_info(rdef["c"])
-    # also prepares _re
-    image.setActiveChannels(channels, windows, colors, invert_flags)
-    if rdef["m"] == "g":
-        image.setGreyscaleRenderingModel()
-    else:
-        image.setColorRenderingModel()
-    if "z" in rdef:
-        image._re.setDefaultZ(long(rdef["z"]) - 1)
-    if "t" in rdef:
-        image._re.setDefaultT(long(rdef["t"]) - 1)
-    image.saveDefaults()
-
-
 @login_required()
 @jsonp
 def copy_image_rdef_json(request, conn=None, **kwargs):
@@ -2323,7 +2178,7 @@ def copy_image_rdef_json(request, conn=None, **kwargs):
     @return:            json dict of Boolean:[Image-IDs]
     """
 
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
     json_data = False
 
     fromid = request.GET.get("fromid", None)
@@ -2375,6 +2230,42 @@ def copy_image_rdef_json(request, conn=None, **kwargs):
     # Check session for 'fromid'
     if fromid is None:
         fromid = request.session.get("fromid", None)
+
+    # maybe these pair of methods should be on ImageWrapper??
+    def getRenderingSettings(image):
+        rv = {}
+        chs = []
+        maps = []
+        for i, ch in enumerate(image.getChannels()):
+            act = "" if ch.isActive() else "-"
+            start = ch.getWindowStart()
+            end = ch.getWindowEnd()
+            color = ch.getLut()
+            maps.append({"inverted": {"enabled": ch.isInverted()}})
+            if not color or len(color) == 0:
+                color = ch.getColor().getHtml()
+            chs.append("%s%s|%s:%s$%s" % (act, i + 1, start, end, color))
+        rv["c"] = ",".join(chs)
+        rv["maps"] = maps
+        rv["m"] = "g" if image.isGreyscaleRenderingModel() else "c"
+        rv["z"] = image.getDefaultZ() + 1
+        rv["t"] = image.getDefaultT() + 1
+        return rv
+
+    def applyRenderingSettings(image, rdef):
+        invert_flags = _get_maps_enabled(rdef, "inverted", image.getSizeC())
+        channels, windows, colors = _split_channel_info(rdef["c"])
+        # also prepares _re
+        image.setActiveChannels(channels, windows, colors, invert_flags)
+        if rdef["m"] == "g":
+            image.setGreyscaleRenderingModel()
+        else:
+            image.setColorRenderingModel()
+        if "z" in rdef:
+            image._re.setDefaultZ(long(rdef["z"]) - 1)
+        if "t" in rdef:
+            image._re.setDefaultT(long(rdef["t"]) - 1)
+        image.saveDefaults()
 
     # Use rdef from above or previously saved one...
     if rdef is None:
@@ -2482,7 +2373,7 @@ def full_viewer(request, iid, conn=None, **kwargs):
     @return:            html page of image and metadata
     """
 
-    server_id = request.session["connector"]["server_id"]
+    server_id = request.session["connector"].server_id
     server_name = Server.get(server_id).server
 
     rid = getImgDetailsFromReq(request)
@@ -2587,8 +2478,14 @@ def download_as(request, iid=None, conn=None, **kwargs):
         return HttpResponseServerError(msg)
 
     if len(images) == 1:
-        # not expected, as download_placeholder is for multiple images
-        return render_image(request, images[0].id, conn=conn, download=True)
+        jpeg_data = images[0].renderJpeg()
+        if jpeg_data is None:
+            raise Http404
+        rsp = HttpResponse(jpeg_data, mimetype="image/jpeg")
+        rsp["Content-Length"] = len(jpeg_data)
+        rsp["Content-Disposition"] = "attachment; filename=%s.jpg" % (
+            images[0].getName().replace(" ", "_")
+        )
     else:
         temp = tempfile.NamedTemporaryFile(suffix=".download_as")
 
@@ -2779,12 +2676,7 @@ def original_file_paths(request, iid, conn=None, **kwargs):
     if image is None:
         raise Http404
     paths = image.getImportedImageFilePaths()
-    fileset_id = image.fileset.id.val
-    return {
-        "repo": paths["server_paths"],
-        "client": paths["client_paths"],
-        "fileset": {"id": fileset_id},
-    }
+    return {"repo": paths["server_paths"], "client": paths["client_paths"]}
 
 
 @login_required()
@@ -2885,11 +2777,12 @@ def su(request, user, conn=None, **kwargs):
     """
     if request.method == "POST":
         conn.setGroupNameForSession("system")
-        connector = Connector.from_session(request)
+        connector = request.session["connector"]
+        connector = Connector(connector.server_id, connector.is_secure)
         session = conn.getSessionService().getSession(conn._sessionUuid)
         ttl = session.getTimeToIdle().val
         connector.omero_session_key = conn.suConn(user, ttl=ttl)._sessionUuid
-        connector.to_session(request)
+        request.session["connector"] = connector
         conn.revertGroupForSession()
         conn.close()
         return True
@@ -2985,9 +2878,7 @@ def _bulk_file_annotations(request, objtype, objid, conn=None, **kwargs):
         data.append(
             dict(
                 id=annotation.id.val,
-                name=unwrap(annotation.file.name),
                 file=annotation.file.id.val,
-                ns=unwrap(annotation.ns),
                 parentType=objtype[0],
                 parentId=link.parent.id.val,
                 owner=ownerName,
@@ -3001,16 +2892,38 @@ def _bulk_file_annotations(request, objtype, objid, conn=None, **kwargs):
 annotations = login_required()(jsonp(_bulk_file_annotations))
 
 
-def perform_table_query(
-    conn,
-    fileid,
-    query,
-    col_names,
-    offset=0,
-    limit=None,
-    lazy=False,
-    check_max_rows=True,
-):
+def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
+    """
+    Query a table specified by fileid
+    Returns a dictionary with query result if successful, error information
+    otherwise
+
+    @param request:     http request; querystring must contain key 'query'
+                        with query to be executed, or '*' to retrieve all rows.
+                        If query is in the format word-number, e.g. "Well-7",
+                        if will be run as (word==number), e.g. "(Well==7)".
+                        This is supported to allow more readable query strings.
+    @param fileid:      Numeric identifier of file containing the table
+    @param query:       The table query. If None, use request.GET.get('query')
+                        E.g. '*' to return all rows.
+                        If in the form 'colname-1', query will be (colname==1)
+    @param lazy:        If True, instead of returning a 'rows' list,
+                        'lazy_rows' will be a generator.
+                        Each gen.next() will return a list of row data
+                        AND 'table' returned MUST be closed.
+    @param conn:        L{omero.gateway.BlitzGateway}
+    @param **kwargs:    offset, limit
+    @return:            A dictionary with key 'error' with an error message
+                        or with key 'data' containing a dictionary with keys
+                        'columns' (an array of column names) and 'rows'
+                        (an array of rows, each an array of values)
+    """
+    if query is None:
+        query = request.GET.get("query")
+    if not query:
+        return dict(error="Must specify query parameter, use * to retrieve all")
+    col_names = request.GET.getlist("col_names")
+
     ctx = conn.createServiceOptsDict()
     ctx.setOmeroGroup("-1")
 
@@ -3021,6 +2934,7 @@ def perform_table_query(
 
     try:
         cols = t.getHeaders()
+        column_names = [col.name for col in cols]
         col_indices = range(len(cols))
         if col_names:
             enumerated_columns = (
@@ -3031,17 +2945,26 @@ def perform_table_query(
             cols = []
             col_indices = []
             for col_name in col_names:
-                for i, j in enumerated_columns:
+                for (i, j) in enumerated_columns:
                     if col_name == j.name:
                         col_indices.append(i)
                         cols.append(j)
                         break
 
-        column_names = [col.name for col in cols]
         rows = t.getNumberOfRows()
 
+        offset = kwargs.get("offset", 0)
+        limit = kwargs.get("limit", None)
+        if not offset:
+            offset = int(request.GET.get("offset", 0))
+        if not limit:
+            limit = (
+                int(request.GET.get("limit"))
+                if request.GET.get("limit") is not None
+                else rows
+            )
         range_start = offset
-        range_size = limit if limit is not None else rows
+        range_size = limit
         range_end = min(rows, range_start + range_size)
 
         if query == "*":
@@ -3064,14 +2987,6 @@ def perform_table_query(
                 hits = hits[range_start:range_end]
             except Exception:
                 return dict(error="Error executing query: %s" % query)
-
-        if check_max_rows:
-            if len(hits) > settings.MAX_TABLE_DOWNLOAD_ROWS:
-                error = (
-                    "Trying to download %s rows exceeds configured"
-                    " omero.web.max_table_download_rows of %s"
-                ) % (len(hits), settings.MAX_TABLE_DOWNLOAD_ROWS)
-                return {"error": error, "status": 404}
 
         def row_generator(table, h):
             # hits are all consecutive rows - can load them in batches
@@ -3116,53 +3031,6 @@ def perform_table_query(
     finally:
         if not lazy:
             t.close()
-
-
-def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
-    """
-    Query a table specified by fileid
-    Returns a dictionary with query result if successful, error information
-    otherwise
-
-    @param request:     http request; querystring must contain key 'query'
-                        with query to be executed, or '*' to retrieve all rows.
-                        If query is in the format word-number, e.g. "Well-7",
-                        if will be run as (word==number), e.g. "(Well==7)".
-                        This is supported to allow more readable query strings.
-    @param fileid:      Numeric identifier of file containing the table
-    @param query:       The table query. If None, use request.GET.get('query')
-                        E.g. '*' to return all rows.
-                        If in the form 'colname-1', query will be (colname==1)
-    @param lazy:        If True, instead of returning a 'rows' list,
-                        'lazy_rows' will be a generator.
-                        Each gen.next() will return a list of row data
-                        AND 'table' returned MUST be closed.
-    @param conn:        L{omero.gateway.BlitzGateway}
-    @param **kwargs:    offset, limit
-    @return:            A dictionary with key 'error' with an error message
-                        or with key 'data' containing a dictionary with keys
-                        'columns' (an array of column names) and 'rows'
-                        (an array of rows, each an array of values)
-    """
-    if query is None:
-        query = request.GET.get("query")
-    if not query:
-        return dict(error="Must specify query parameter, use * to retrieve all")
-    col_names = request.GET.getlist("col_names")
-
-    offset = kwargs.get("offset", 0)
-    limit = kwargs.get("limit", None)
-    if not offset:
-        offset = int(request.GET.get("offset", 0))
-    if not limit:
-        limit = (
-            int(request.GET.get("limit"))
-            if request.GET.get("limit") is not None
-            else None
-        )
-    return perform_table_query(
-        conn, fileid, query, col_names, offset=offset, limit=limit, lazy=lazy
-    )
 
 
 table_query = login_required()(jsonp(_table_query))
@@ -3211,93 +3079,6 @@ def _table_metadata(request, fileid, conn=None, query=None, lazy=False, **kwargs
 
 
 table_metadata = login_required()(jsonp(_table_metadata))
-
-
-@login_required()
-@jsonp
-def obj_id_bitmask(request, fileid, conn=None, query=None, **kwargs):
-    """
-    Get an ID bitmask representing which ids match the given query
-    Returns a http response where the content is a 0-indexed array of
-    big-endian bit-ordered bytes representing the selected ids.
-    E.g. if your query returns IDs 1,2,7, 11, and 12, you will
-    get back 0110000100011000, or [97, 24]. The response will be the
-    smallest number of bytes necessary to represent all IDs and will
-    be padded with 0s to the end of the byte.
-
-    @param request:     http request; querystring must contain key 'query'
-                        with query to be executed, or '*' to retrieve all rows.
-                        If query is in the format word-number, e.g. "Well-7",
-                        if will be run as (word==number), e.g. "(Well==7)".
-                        This is supported to allow more readable query strings.
-                        querystring may optionally specify 'col_name' which is
-                        the ID column to use to create the mask. By default
-                        'object' is used.
-    @param fileid:      Numeric identifier of file containing the table
-    @param query:       The table query. If None, use request.GET.get('query')
-                        E.g. '*' to return all rows.
-                        If in the form 'colname-1', query will be (colname==1)
-    @param conn:        L{omero.gateway.BlitzGateway}
-    @param **kwargs:    offset, limit
-    @return:            A dictionary with key 'error' with an error message
-                        or with an array of bytes as described above
-    """
-
-    if not numpyInstalled:
-        raise NotImplementedError("numpy not installed")
-    col_name = request.GET.get("col_name", "object")
-    if query is None:
-        query = request.GET.get("query")
-    if not query:
-        return dict(error="Must specify query parameter, use * to retrieve all")
-
-    offset = kwargs.get("offset", 0)
-    limit = kwargs.get("limit", None)
-    if not offset:
-        offset = int(request.GET.get("offset", 0))
-    if not limit:
-        limit = (
-            int(request.GET.get("limit"))
-            if request.GET.get("limit") is not None
-            else None
-        )
-
-    rsp_data = perform_table_query(
-        conn,
-        fileid,
-        query,
-        [col_name],
-        offset=offset,
-        limit=limit,
-        lazy=False,
-        check_max_rows=False,
-    )
-    if "error" in rsp_data:
-        return rsp_data
-    try:
-        data = rowsToByteArray(rsp_data["data"]["rows"])
-        return HttpResponse(bytes(data), content_type="application/octet-stream")
-    except ValueError:
-        logger.error("ValueError when getting obj_id_bitmask")
-        return {"error": "Specified column has invalid type"}
-
-
-def rowsToByteArray(rows):
-    maxval = 0
-    if len(rows) > 0 and type(rows[0][0]) == float:
-        raise ValueError("Cannot have ID of float")
-    for obj in rows:
-        obj_id = int(obj[0])
-        maxval = max(obj_id, maxval)
-    bitArray = numpy.zeros(maxval + 1, dtype="uint8")
-    for obj in rows:
-        obj_id = int(obj[0])
-        bitArray[obj_id] = 1
-    packed = numpy.packbits(bitArray, bitorder="big")
-    data = bytearray()
-    for val in packed:
-        data.append(val)
-    return data
 
 
 @login_required()
@@ -3436,7 +3217,6 @@ class LoginView(View):
         """
         error = None
         form = self.form_class(request.POST.copy())
-        userip = get_client_ip(request)
         if form.is_valid():
             username = form.cleaned_data["username"]
             password = form.cleaned_data["password"]
@@ -3456,11 +3236,11 @@ class LoginView(View):
                 and compatible
             ):
                 conn = connector.create_connection(
-                    self.useragent, username, password, userip=userip
+                    self.useragent, username, password, userip=get_client_ip(request)
                 )
                 if conn is not None:
                     try:
-                        connector.to_session(request)
+                        request.session["connector"] = connector
                         # UpgradeCheck URL should be loaded from the server or
                         # loaded omero.web.upgrades.url allows to customize web
                         # only
@@ -3489,30 +3269,6 @@ class LoginView(View):
                     )
                 else:
                     error = settings.LOGIN_INCORRECT_CREDENTIALS_TEXT
-        elif "connector" in request.session and (
-            len(form.data) == 0
-            or ("csrfmiddlewaretoken" in form.data and len(form.data) == 1)
-        ):
-            # If we appear to already be logged in and the form we've been
-            # provided is empty repeat the "logged in" behaviour so a user
-            # can get their event context.  A form with length 1 is considered
-            # empty as a valid CSRF token is required to even get into this
-            # method.  The CSRF token may also have been provided via HTTP
-            # header in which case the form length will be 0.
-            connector = Connector.from_session(request)
-            # Do not allow retrieval of the event context of the public user
-            if not connector.is_public:
-                conn = connector.join_connection(self.useragent, userip)
-                # Connection is None if it could not be successfully joined
-                # and any omero.client objects will have had close() called
-                # on them.
-                if conn is not None:
-                    try:
-                        return self.handle_logged_in(request, conn, connector)
-                    except Exception:
-                        pass
-                    finally:
-                        conn.close(hard=False)
         return self.handle_not_logged_in(request, error, form)
 
 
