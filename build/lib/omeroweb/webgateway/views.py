@@ -120,20 +120,12 @@ except ImportError:
 
 
 def index(request):
-    """/webgateway/ index placeholder"""
+    """ /webgateway/ index placeholder """
     return HttpResponse("Welcome to webgateway")
 
 
 def _safestr(s):
     return unicode(s).encode("utf-8")
-
-
-# Regular expression that represents the characters in ASCII that are
-# allowed in a valid JavaScript variable name.  Function names adhere to
-# the same rules.
-# See:
-#   https://stackoverflow.com/questions/1661197/what-characters-are-valid-for-javascript-variable-names
-VALID_JS_VARIABLE = re.compile(r"^[a-zA-Z_$][0-9a-zA-Z_$]*$")
 
 
 class UserProxy(object):
@@ -155,7 +147,7 @@ class UserProxy(object):
         self.loggedIn = False
 
     def logIn(self):
-        """Sets the loggedIn Flag to True"""
+        """ Sets the loggedIn Flag to True """
 
         self.loggedIn = True
 
@@ -765,7 +757,7 @@ def get_shape_thumbnail(request, conn, image, s, compress_quality):
 
 @login_required()
 def render_shape_mask(request, shapeId, conn=None, **kwargs):
-    """Returns mask as a png (supports transparency)"""
+    """ Returns mask as a png (supports transparency) """
 
     if not numpyInstalled:
         raise NotImplementedError("numpy not installed")
@@ -1443,8 +1435,6 @@ def jsonp(f):
                 return rv
             c = request.GET.get("callback", None)
             if c is not None and not kwargs.get("_internal", False):
-                if not VALID_JS_VARIABLE.match(c):
-                    return HttpResponseBadRequest("Invalid callback")
                 rv = json.dumps(rv)
                 rv = "%s(%s)" % (c, rv)
                 # mimetype for JSONP is application/javascript
@@ -1605,13 +1595,7 @@ def wellData_json(request, conn=None, _internal=False, **kwargs):
 @login_required()
 @jsonp
 def plateGrid_json(request, pid, field=0, conn=None, **kwargs):
-    """
-    Layout depends on settings 'omero.web.plate_layout' which
-    can be overridden with request param e.g. ?layout=shrink.
-    Use "expand" to expand to multiple of 8 x 12 grid
-    Or "shrink" to remove rows/cols before first Well
-    Or "trim" to neither expand nor shrink
-    """
+    """"""
     try:
         field = long(field or 0)
     except ValueError:
@@ -1626,17 +1610,7 @@ def plateGrid_json(request, pid, field=0, conn=None, **kwargs):
             return reverse(prefix, args=(iid, thumbsize))
         return reverse(prefix, args=(iid,))
 
-    layout = request.GET.get("layout")
-    if layout not in ("shrink", "trim", "expand"):
-        layout = settings.PLATE_LAYOUT
-
-    plateGrid = PlateGrid(
-        conn,
-        pid,
-        field,
-        kwargs.get("urlprefix", get_thumb_url),
-        plate_layout=layout,
-    )
+    plateGrid = PlateGrid(conn, pid, field, kwargs.get("urlprefix", get_thumb_url))
 
     plate = plateGrid.plate
     if plate is None:
@@ -1749,7 +1723,7 @@ def listImages_json(request, did, conn=None, **kwargs):
         "thumbUrlPrefix": kwargs.get("urlprefix", urlprefix),
         "tiled": request.GET.get("tiled", False),
     }
-    return [x.simpleMarshal(xtra=xtra) for x in dataset.listChildren()]
+    return map(lambda x: x.simpleMarshal(xtra=xtra), dataset.listChildren())
 
 
 @login_required()
@@ -2017,7 +1991,9 @@ def search_json(request, conn=None, **kwargs):
                     logger.debug("(iid %i) ignoring Server Error: %s" % (e.id, str(x)))
             return rv
         else:
-            return [x.simpleMarshal(xtra=xtra, parents=opts["parents"]) for x in sr]
+            return map(
+                lambda x: x.simpleMarshal(xtra=xtra, parents=opts["parents"]), sr
+            )
 
     rv = timeit(marshal)()
     logger.debug(rv)
@@ -2566,7 +2542,9 @@ def download_as(request, iid=None, conn=None, **kwargs):
             temp.close()
             stack = traceback.format_exc()
             logger.error(stack)
-            return HttpResponseServerError("Cannot download file (id:%s)" % iid)
+            return HttpResponseServerError(
+                "Cannot download file (id:%s).\n%s" % (iid, stack)
+            )
 
     rsp["Content-Type"] = "application/force-download"
     return rsp
@@ -2918,123 +2896,6 @@ def _bulk_file_annotations(request, objtype, objid, conn=None, **kwargs):
 annotations = login_required()(jsonp(_bulk_file_annotations))
 
 
-def perform_table_query(
-    conn,
-    fileid,
-    query,
-    col_names,
-    offset=0,
-    limit=None,
-    lazy=False,
-    check_max_rows=True,
-):
-    ctx = conn.createServiceOptsDict()
-    ctx.setOmeroGroup("-1")
-
-    r = conn.getSharedResources()
-    t = r.openTable(omero.model.OriginalFileI(fileid), ctx)
-    if not t:
-        return dict(error="Table %s not found" % fileid)
-
-    try:
-        cols = t.getHeaders()
-        col_indices = range(len(cols))
-        if col_names:
-            enumerated_columns = (
-                [(i, j) for (i, j) in enumerate(cols) if j.name in col_names]
-                if col_names
-                else [(i, j) for (i, j) in enumerate(cols)]
-            )
-            cols = []
-            col_indices = []
-            for col_name in col_names:
-                for (i, j) in enumerated_columns:
-                    if col_name == j.name:
-                        col_indices.append(i)
-                        cols.append(j)
-                        break
-
-        column_names = [col.name for col in cols]
-        rows = t.getNumberOfRows()
-
-        range_start = offset
-        range_size = limit if limit is not None else rows
-        range_end = min(rows, range_start + range_size)
-
-        if query == "*":
-            hits = range(range_start, range_end)
-            totalCount = rows
-        else:
-            match = re.match(r"^(\w+)-(\d+)", query)
-            if match:
-                c_name = match.group(1)
-                if c_name in ("Image", "Roi", "Plate", "Well"):
-                    # older tables may have column named e.g. 'image'
-                    if c_name not in column_names and c_name.lower() in column_names:
-                        c_name = c_name.lower()
-                query = "(%s==%s)" % (c_name, match.group(2))
-            try:
-                logger.info(query)
-                hits = t.getWhereList(query, None, 0, rows, 1)
-                totalCount = len(hits)
-                # paginate the hits
-                hits = hits[range_start:range_end]
-            except Exception:
-                return dict(error="Error executing query: %s" % query)
-
-        if check_max_rows:
-            if len(hits) > settings.MAX_TABLE_DOWNLOAD_ROWS:
-                error = (
-                    "Trying to download %s rows exceeds configured"
-                    " omero.web.max_table_download_rows of %s"
-                ) % (len(hits), settings.MAX_TABLE_DOWNLOAD_ROWS)
-                return {"error": error, "status": 404}
-
-        def row_generator(table, h):
-            # hits are all consecutive rows - can load them in batches
-            idx = 0
-            batch = 1000
-            while idx < len(h):
-                batch = min(batch, len(h) - idx)
-                res = table.slice(col_indices, h[idx : idx + batch])
-                idx += batch
-                # yield a list of rows
-                yield [
-                    [col.values[row] for col in res.columns]
-                    for row in range(0, len(res.rowNumbers))
-                ]
-
-        row_gen = row_generator(t, hits)
-
-        rsp_data = {
-            "data": {
-                "column_types": [col.__class__.__name__ for col in cols],
-                "columns": column_names,
-            },
-            "meta": {
-                "rowCount": rows,
-                "totalCount": totalCount,
-                "limit": limit,
-                "offset": offset,
-            },
-        }
-
-        if not lazy:
-            row_data = []
-            # Use the generator to add all rows in batches
-            for rows in list(row_gen):
-                row_data.extend(rows)
-            rsp_data["data"]["rows"] = row_data
-        else:
-            rsp_data["data"]["lazy_rows"] = row_gen
-            rsp_data["table"] = t
-
-        return rsp_data
-    finally:
-        if not lazy:
-            t.close()
-
-
 def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
     """
     Query a table specified by fileid
@@ -3065,27 +2926,7 @@ def _table_query(request, fileid, conn=None, query=None, lazy=False, **kwargs):
         query = request.GET.get("query")
     if not query:
         return dict(error="Must specify query parameter, use * to retrieve all")
-    col_names = request.GET.getlist("col_names")
 
-    offset = kwargs.get("offset", 0)
-    limit = kwargs.get("limit", None)
-    if not offset:
-        offset = int(request.GET.get("offset", 0))
-    if not limit:
-        limit = (
-            int(request.GET.get("limit"))
-            if request.GET.get("limit") is not None
-            else None
-        )
-    return perform_table_query(
-        conn, fileid, query, col_names, offset=offset, limit=limit, lazy=lazy
-    )
-
-
-table_query = login_required()(jsonp(_table_query))
-
-
-def _table_metadata(request, fileid, conn=None, query=None, lazy=False, **kwargs):
     ctx = conn.createServiceOptsDict()
     ctx.setOmeroGroup("-1")
 
@@ -3097,124 +2938,86 @@ def _table_metadata(request, fileid, conn=None, query=None, lazy=False, **kwargs
     try:
         cols = t.getHeaders()
         rows = t.getNumberOfRows()
-        allmeta = t.getAllMetadata()
 
-        user_metadata = {}
-        for k in allmeta:
-            if allmeta[k].__class__ == omero.rtypes.RStringI:
-                try:
-                    val = json.loads(allmeta[k].val)
-                    user_metadata[k] = val
-                except json.decoder.JSONDecodeError:
-                    user_metadata[k] = allmeta[k].val
+        offset = kwargs.get("offset", 0)
+        limit = kwargs.get("limit", None)
+
+        range_start = offset
+        range_size = kwargs.get("limit", rows)
+        range_end = min(rows, range_start + range_size)
+
+        if query == "*":
+            hits = range(range_start, range_end)
+            totalCount = rows
+        else:
+            match = re.match(r"^(\w+)-(\d+)", query)
+            if match:
+                query = "(%s==%s)" % (match.group(1), match.group(2))
+            try:
+                hits = t.getWhereList(query, None, 0, rows, 1)
+                totalCount = len(hits)
+                # paginate the hits
+                hits = hits[range_start:range_end]
+            except Exception:
+                return dict(error="Error executing query: %s" % query)
+
+        def row_generator(table, h):
+            if query == "*":
+                # hits are all consecutive rows - can load them in batches
+                idx = 0
+                batch = 1000
+                while idx < len(h):
+                    batch = min(batch, len(h) - idx)
+                    row_data = [[] for r in range(batch)]
+                    for col in table.read(
+                        range(len(cols)), h[idx], h[idx] + batch
+                    ).columns:
+                        for r in range(batch):
+                            row_data[r].append(col.values[r])
+                    idx += batch
+                    # yield a list of rows
+                    yield row_data
             else:
-                user_metadata[k] = allmeta[k].val
+                for hit in h:
+                    row_vals = [
+                        col.values[0]
+                        for col in table.read(range(len(cols)), hit, hit + 1).columns
+                    ]
+                    # yield a list of rows, with only a single row
+                    yield [row_vals]
+
+        row_gen = row_generator(t, hits)
+
         rsp_data = {
-            "columns": [
-                {
-                    "name": col.name,
-                    "description": col.description,
-                    "type": col.__class__.__name__,
-                }
-                for col in cols
-            ],
-            "totalCount": rows,
-            "user_metadata": user_metadata,
+            "data": {
+                "column_types": [col.__class__.__name__ for col in cols],
+                "columns": [col.name for col in cols],
+            },
+            "meta": {
+                "rowCount": rows,
+                "totalCount": totalCount,
+                "limit": limit,
+                "offset": offset,
+            },
         }
+
+        if not lazy:
+            row_data = []
+            # Use the generator to add all rows in batches
+            for rows in list(row_gen):
+                row_data.extend(rows)
+            rsp_data["data"]["rows"] = row_data
+        else:
+            rsp_data["data"]["lazy_rows"] = row_gen
+            rsp_data["table"] = t
+
         return rsp_data
     finally:
         if not lazy:
             t.close()
 
 
-table_metadata = login_required()(jsonp(_table_metadata))
-
-
-@login_required()
-@jsonp
-def obj_id_bitmask(request, fileid, conn=None, query=None, **kwargs):
-    """
-    Get an ID bitmask representing which ids match the given query
-    Returns a http response where the content is a 0-indexed array of
-    big-endian bit-ordered bytes representing the selected ids.
-    E.g. if your query returns IDs 1,2,7, 11, and 12, you will
-    get back 0110000100011000, or [97, 24]. The response will be the
-    smallest number of bytes necessary to represent all IDs and will
-    be padded with 0s to the end of the byte.
-
-    @param request:     http request; querystring must contain key 'query'
-                        with query to be executed, or '*' to retrieve all rows.
-                        If query is in the format word-number, e.g. "Well-7",
-                        if will be run as (word==number), e.g. "(Well==7)".
-                        This is supported to allow more readable query strings.
-                        querystring may optionally specify 'col_name' which is
-                        the ID column to use to create the mask. By default
-                        'object' is used.
-    @param fileid:      Numeric identifier of file containing the table
-    @param query:       The table query. If None, use request.GET.get('query')
-                        E.g. '*' to return all rows.
-                        If in the form 'colname-1', query will be (colname==1)
-    @param conn:        L{omero.gateway.BlitzGateway}
-    @param **kwargs:    offset, limit
-    @return:            A dictionary with key 'error' with an error message
-                        or with an array of bytes as described above
-    """
-
-    if not numpyInstalled:
-        raise NotImplementedError("numpy not installed")
-    col_name = request.GET.get("col_name", "object")
-    if query is None:
-        query = request.GET.get("query")
-    if not query:
-        return dict(error="Must specify query parameter, use * to retrieve all")
-
-    offset = kwargs.get("offset", 0)
-    limit = kwargs.get("limit", None)
-    if not offset:
-        offset = int(request.GET.get("offset", 0))
-    if not limit:
-        limit = (
-            int(request.GET.get("limit"))
-            if request.GET.get("limit") is not None
-            else None
-        )
-
-    rsp_data = perform_table_query(
-        conn,
-        fileid,
-        query,
-        [col_name],
-        offset=offset,
-        limit=limit,
-        lazy=False,
-        check_max_rows=False,
-    )
-    if "error" in rsp_data:
-        return rsp_data
-    try:
-        data = rowsToByteArray(rsp_data["data"]["rows"])
-        return HttpResponse(bytes(data), content_type="application/octet-stream")
-    except ValueError:
-        logger.error("ValueError when getting obj_id_bitmask")
-        return {"error": "Specified column has invalid type"}
-
-
-def rowsToByteArray(rows):
-    maxval = 0
-    if len(rows) > 0 and type(rows[0][0]) == float:
-        raise ValueError("Cannot have ID of float")
-    for obj in rows:
-        obj_id = int(obj[0])
-        maxval = max(obj_id, maxval)
-    bitArray = numpy.zeros(maxval + 1, dtype="uint8")
-    for obj in rows:
-        obj_id = int(obj[0])
-        bitArray[obj_id] = 1
-    packed = numpy.packbits(bitArray, bitorder="big")
-    data = bytearray()
-    for val in packed:
-        data.append(val)
-    return data
+table_query = login_required()(jsonp(_table_query))
 
 
 @login_required()
